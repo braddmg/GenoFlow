@@ -1,0 +1,10 @@
+.snakemake/
+results/
+results/roary_1762313813/
+results/roary_1762313693/
+results/prokka/
+results/roary_1764219604/
+Intermediate/
+results/ufcg/
+results/pyANI/
+logs/

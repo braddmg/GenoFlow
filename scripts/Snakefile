@@ -1,0 +1,818 @@
+# Configuration defaults and initialization
+config = globals().get("config", {})
+config_defaults = {
+    "mode": "bacteria",            # bacteria or fungi
+    "outdir": "results",            # output directory
+    "threads": 4,                   # number of threads
+    "genomes": "Data/genomes.txt",  # NCBI accessions file
+    "DNA_mode": False,              # False=protein, True=DNA
+    "use_ncbi_download": False,     # enable NCBI download
+    "use_raxml": False,             # False=IQ-TREE, True=RAxML
+    "run_ani": False,               # ANI analysis
+}
+for key, value in config_defaults.items():
+    if key not in config:
+        config[key] = value
+cfg = config
+
+# Convert string booleans from config to boolean type
+def to_bool(val):
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.lower() in ("true", "yes", "1", "on")
+    return bool(val)
+
+cfg["run_ani"] = to_bool(cfg.get("run_ani", False))
+cfg["use_ncbi_download"] = to_bool(cfg.get("use_ncbi_download", False))
+cfg["use_raxml"] = to_bool(cfg.get("use_raxml", False))
+cfg["DNA_mode"] = to_bool(cfg.get("DNA_mode", False))
+
+# Format timestamp for logging
+from datetime import datetime
+def timestamp():
+    return datetime.now().strftime("%H:%M:%S")
+
+
+if workflow.cores:
+    cfg["threads"] = workflow.cores  
+
+import os, glob, shutil, pathlib, subprocess, re
+
+# Validate fungi mode requires 4+ genomes
+if cfg.get("mode") == "fungi":
+    genomes_file = cfg.get("genomes", "Data/genomes.txt")
+    n_genomes = 0
+    
+    if os.path.exists(genomes_file):
+        with open(genomes_file) as f:
+            n_genomes = sum(1 for line in f if line.strip() and not line.startswith("#"))
+    
+    if n_genomes < 4:
+        raise ValueError(
+            f"[GenFlow ERROR] Fungi mode requires at least 4 genomes.\n"
+            f"Found: {n_genomes} genomes in {genomes_file}\n"
+            f"Please add more genomes or use bacteria mode (mode=bacteria)."
+        )
+
+# Suppress Snakemake verbosity
+onstart:
+    import logging
+    logger = logging.getLogger("snakemake")
+    logger.setLevel(logging.WARNING)
+
+def detect_samples():
+    """Extract unique sample stems from FASTA files in Intermediate/."""
+    import glob, pathlib
+    samples = []
+    for ext in ["*.fasta", "*.fa", "*.fna"]:
+        samples.extend([pathlib.Path(f).stem for f in glob.glob(f"Intermediate/{ext}")])
+    return sorted(set(samples))
+
+SAMPLES = detect_samples()
+
+# Working directories
+WORKDIR = pathlib.Path(os.getcwd())
+OUTDIR  = WORKDIR / cfg["outdir"]
+INTDIR  = WORKDIR / "Intermediate"
+LOGDIR  = WORKDIR / "logs"
+OUTDIR.mkdir(parents=True, exist_ok=True)
+INTDIR.mkdir(parents=True, exist_ok=True)
+LOGDIR.mkdir(parents=True, exist_ok=True)
+
+cfg['scripts_dir'] = str(WORKDIR / "scripts")
+cfg['edirect_dir'] = str(WORKDIR / "scripts" / "edirect")
+
+# Helper functions
+def find_fastas_from_defaults(include_intermediate=False):
+    """Discover FASTA files from Data/ and optionally Intermediate/."""
+    patterns = ["Data/*.fasta", "data/*.fasta", "*.fasta"]
+    if include_intermediate:
+        patterns.extend(["Intermediate/*.fasta", "Intermediate/*.fa", "Intermediate/*.fna"])
+    files = []
+    for pat in patterns:
+        for f in glob.glob(pat):
+            p = pathlib.Path(f).resolve()
+            if p.exists():
+                files.append(str(p))
+    return sorted(set(files))
+
+def copy_fastas(fasta_csv, list_path, flag_path):
+    """Copy input FASTA files into Intermediate/ with sample prefixes."""
+    dest = INTDIR
+    dest.mkdir(exist_ok=True)
+
+    if not cfg.get("use_ncbi_download", False):
+        for f in dest.glob("*"):
+            if f.is_file():
+                f.unlink()
+
+    files = []
+    if fasta_csv:
+        for f in fasta_csv.split(","):
+            p = pathlib.Path(f.strip())
+            if not p.exists():
+                p = (WORKDIR / f.strip()).resolve()
+            if p.exists():
+                files.append(str(p))
+            else:
+                print(f"Warning: FASTA file not found -> {f.strip()}")
+    if not files and not cfg.get("use_ncbi_download", False):
+        raise SystemExit("No FASTA provided. Use --config fasta=path1,path2 or enable NCBI download (-d).")
+
+    if files:
+        for f in files:
+            sample = pathlib.Path(f).stem
+            dest_path = dest / f"{sample}.fasta"
+            src_path = pathlib.Path(f)
+            if not src_path.exists():
+                src_path = (WORKDIR / f).resolve()
+            if src_path.exists() and src_path.is_file() and src_path.stat().st_size > 0:
+                with open(src_path) as inp, open(dest_path, 'w') as out:
+                    for line in inp:
+                        if line.startswith('>'):
+                            out.write(f">{sample}_{line[1:]}")
+                        else:
+                            out.write(line)
+            else:
+                print(f"Warning: FASTA file not found or empty -> {src_path}")
+
+        with open(list_path, "w") as out:
+            out.write("\n".join(files) + "\n")
+    else:
+        with open(list_path, "w") as out:
+            out.write("")
+
+    pathlib.Path(flag_path).write_text("collected\n")
+
+
+def combine_fastas(out_fa):
+    """Concatenate all FASTA files from Intermediate/ into single combined file."""
+    out = pathlib.Path(out_fa)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    patterns = ["*.fasta", "*.fa", "*.fna"]
+    files = []
+    for pat in patterns:
+        files.extend(glob.glob(str(INTDIR / pat)))
+    files = sorted(set(files))
+    if not files:
+        raise SystemExit("No sequence files in Intermediate/. Ensure NCBI download or local FASTA present.")
+    with open(out, "w") as OUT:
+        for f in files:
+            with open(f) as IN:
+                txt = IN.read().rstrip()
+                if not txt.endswith("\n"):
+                    txt += "\n"
+                OUT.write(txt)
+
+def generate_individual_sequence_names(combined_fasta, output_map):
+    """Extract and rename individual sequences: SAMPLE_NODENUMBER_LXXXK_CYYY."""
+    name_map = {}
+    
+    with open(combined_fasta) as f:
+        for line in f:
+            if line.startswith('>'):
+                header = line[1:].strip()
+                match = re.search(r'NODE_(\d+)_length_(\d+)_cov_([\d.]+)', header)
+                if match:
+                    node_num = match.group(1)
+                    length = int(match.group(2))
+                    cov = float(match.group(3))
+                    
+                    sample_match = re.match(r'(\w+)_NODE_', header)
+                    if sample_match:
+                        sample_name = sample_match.group(1)
+                    else:
+                        sample_name = "UNKNOWN"
+                    
+                    length_kb = length // 1000
+                    cov_int = int(cov)
+                    new_id = f"{sample_name}_NODE{node_num}_L{length_kb}k_C{cov_int}"
+                    name_map[header] = new_id
+
+    with open(output_map, 'w') as f:
+        for orig, new in name_map.items():
+            f.write(f"{orig}\t{new}\n")
+    
+    return len(name_map)
+
+def rename_sequences_in_gff(gff_file, name_map_file, output_gff):
+    """Replace sequence IDs in GFF file using mapping from TSV."""
+    # Load name map
+    name_map = {}
+    with open(name_map_file) as f:
+        for line in f:
+            orig, new = line.rstrip('\n').split('\t')
+            name_map[orig] = new
+    
+    # Process GFF
+    with open(gff_file) as inp, open(output_gff, 'w') as out:
+        for line in inp:
+            if line.startswith('#'):
+                out.write(line)
+            else:
+                parts = line.rstrip('\n').split('\t')
+                if len(parts) >= 1:
+                    seqid = parts[0]
+                    if seqid in name_map:
+                        parts[0] = name_map[seqid]
+                    out.write('\t'.join(parts) + '\n')
+                else:
+                    out.write(line)
+
+
+def _get_sample_stems():
+    """Return sorted unique sample names from FASTA files."""
+    files = []
+    if cfg.get("fasta"):
+        files = [s.strip() for s in str(cfg["fasta"]).split(",") if s.strip()]
+    elif cfg.get("use_ncbi_download", False):
+        files = find_fastas_from_defaults(include_intermediate=True)
+    stems = [pathlib.Path(f).stem for f in files]
+    return sorted(set(stems))
+
+SAMPLES = _get_sample_stems()
+
+tree_target = [
+    f"{cfg['outdir']}/combined.fasta",
+    f"{cfg['outdir']}/aligned.fasta",
+    f"{cfg['outdir']}/phylogenomic-tree.txt",
+    f"{cfg['outdir']}/COLLECT_OK.txt",
+    f"{cfg['outdir']}/name_map.tsv",  
+]
+
+if cfg.get("mode") == "fungi":
+    tree_target += ["results/ufcg/core_genes.faa", "results/ufcg/core_genes.fna"]
+
+ani_targets = [f"{cfg['outdir']}/.ani.done"]
+
+all_targets = list(tree_target)
+if cfg.get("run_ani", False):
+    all_targets += ani_targets
+
+rule all:
+    """Aggregate all pipeline outputs based on configuration."""
+    input: all_targets
+
+# 1) Collect input FASTA into intermediate
+rule collect_fastas:
+    """Copy local FASTA files into Intermediate/ with proper naming."""
+    output:
+        list=f"{cfg['outdir']}/COLLECT_OK.txt",
+        flag="Intermediate/.collected"
+    run:
+        copy_fastas(cfg.get("fasta"), output.list, output.flag)
+
+# 2) NCBI genome download
+rule ncbi_download:
+    """Download reference genomes using NCBI datasets + unzip to Intermediate/."""
+    input:
+        "Intermediate/.collected"
+    output:
+        touch("logs/download.done")
+    shell:
+        r"""
+        set -euo pipefail
+        echo "[GenFlow] [$(date +%H:%M:%S)] Downloading genomes from NCBI..."
+        mkdir -p Intermediate
+        grep -v '^\s*#' {cfg[genomes]} | sed '/^\s*$/d' > Intermediate/genomes.clean.txt
+        if [ ! -s Intermediate/genomes.clean.txt ]; then
+            echo "Error: No valid accessions found in {cfg[genomes]}" >> logs/download.log
+            exit 1
+        fi
+        conda run -n genflow datasets download genome accession \
+            --inputfile Intermediate/genomes.clean.txt >> logs/download.log 2>&1
+        unzip -o 'ncbi_*.zip' >> logs/download.log 2>&1
+        mkdir -p Intermediate
+        mv ncbi_dataset/data/GC*/*.fna Intermediate/ || true
+        rm -rf ncbi_dataset *.zip md5sum.txt README.md || true
+        echo "[GenFlow] [$(date +%H:%M:%S)] NCBI genomes downloaded"
+        """
+
+rule ncbi_rename_with_species:
+    """Rename downloaded NCBI files with organism names from EDirect."""
+    input:
+        "logs/download.done"
+    output:
+        touch("logs/ncbi_renamed.done")
+    shell:
+        r"""
+        set +e
+        echo "[GenFlow] [$(date +%H:%M:%S)] Renaming NCBI files with organism names..."
+        cd Intermediate
+        
+        EDIRECT="{cfg[edirect_dir]}"
+        
+        > ncbi_names.txt
+        for f in GCF_* GCA_*; do
+            [ ! -f "$f" ] && continue
+            [ -d "$f" ] && continue
+            
+            term=$(echo "$f" | cut -f1,2 -d'_')
+            
+            result=$("$EDIRECT/esearch" -db assembly -query "$term" 2>/dev/null | \
+                     "$EDIRECT/esummary" 2>/dev/null | \
+                     "$EDIRECT/xtract" -pattern DocumentSummary -sep ' ' -element Organism,Strain,AssemblyAccession 2>/dev/null | head -1)
+            
+            organism_clean=$(echo "$result" | sed 's/ /_/g; s/://g; s+/+_+g; s/,/_/g; s/\./_/g; s/-/_/g; s/_([^)(]*)//g; s/=//g; s/[;]//g; s/([^)(]*)//g; s/[(]//g; s/[)]//g; s/__/_/g')
+            
+            if [ -z "$organism_clean" ]; then
+                organism_clean=$(echo "$f" | sed 's/.fna$//')
+            fi
+            
+            echo "$f	$organism_clean" >> ncbi_names.txt
+        done
+        
+        while IFS=$'\t' read -r oldname newname; do
+            [ -z "$oldname" ] && continue
+            if [ -f "$oldname" ]; then
+                mv "$oldname" "$newname.fna" 2>/dev/null || true
+            fi
+        done < ncbi_names.txt
+        
+        cd - > /dev/null
+        set -e
+        echo "[GenFlow] [$(date +%H:%M:%S)] NCBI files renamed with organism names"
+        """
+
+if cfg["use_ncbi_download"]:
+    downstream_flag = ["Intermediate/.collected", "logs/download.done", "logs/ncbi_renamed.done"]
+else:
+    downstream_flag = "Intermediate/.collected"
+
+rule generate_name_map:
+    """Combine all FASTA and generate individual sequence identifier mappings."""
+    input:
+        downstream_flag
+    output:
+        combined="results/combined.fasta",
+        name_map="results/name_map.tsv"
+    run:
+        from datetime import datetime
+        start_time = datetime.now().strftime("%H:%M:%S")
+        print(f"[GenFlow] [{start_time}] Generating sequence identifiers...")
+        combine_fastas(output.combined)
+        end_time = datetime.now().strftime("%H:%M:%S")
+        print(f"[GenFlow] [{end_time}] Sequence identifiers generated from FASTA files")
+        generate_individual_sequence_names(output.combined, output.name_map)
+
+# Bacteria workflow: Prokka + Roary annotation and pangenome analysis
+if cfg["mode"] == "bacteria":
+
+    rule annotate_prokka:
+        """Annotate bacterial genomes with Prokka."""
+        input:
+            name_map="results/name_map.tsv"
+        output:
+            touch("logs/prokka.done")
+        shell:
+            r"""
+            set -euo pipefail
+            mkdir -p results/prokka logs
+            echo "[GenFlow] [$(date +%H:%M:%S)] Running Prokka annotations..."
+            shopt -s nullglob
+            
+            total=0
+            for f in Intermediate/*.fasta Intermediate/*.fa Intermediate/*.fna; do
+                [ -f "$f" ] && total=$((total+1))
+            done
+            
+            current=0
+            for f in Intermediate/*.fasta Intermediate/*.fa Intermediate/*.fna; do
+                [ -f "$f" ] || continue
+                current=$((current+1))
+                base=$(basename "$f")
+                base=${{base%.fasta}}
+                base=${{base%.fa}}
+                base=${{base%.fna}}
+                echo "[GenFlow] [Prokka] [$current/$total] Annotating $base"
+                echo "  → Annotating $base" >> logs/prokka.log
+                conda run -n genflow prokka \
+                    --outdir results/prokka/$base \
+                    --prefix $base \
+                    --centre X --compliant \
+                    --cpus {cfg[threads]} \
+                    --force "$f" >> logs/prokka.log 2>&1 || exit 1
+            done
+            echo "[GenFlow] [$(date +%H:%M:%S)] Prokka genome annotations completed"
+            """
+
+    rule rename_prokka_gff:
+        """Rename sequence identifiers in Prokka GFF outputs using name_map."""
+        input:
+            prokka_done="logs/prokka.done",
+            name_map="results/name_map.tsv"
+        output:
+            touch("logs/rename_gff.done")
+        run:
+            import glob, os
+            import pathlib
+            from datetime import datetime
+            
+            start_time = datetime.now().strftime("%H:%M:%S")
+            print(f"[GenFlow] [{start_time}] Renaming sequence IDs in GFF files...")
+            
+            output_dir = pathlib.Path("results/prokka_renamed")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            gff_files = glob.glob("results/prokka/*/*.gff")
+            if not gff_files:
+                raise SystemExit("No Prokka GFF files found!")
+            
+            for gff_file in gff_files:
+                basename = os.path.basename(gff_file)
+                output_file = output_dir / basename
+                rename_sequences_in_gff(gff_file, input.name_map, str(output_file))
+            
+            end_time = datetime.now().strftime("%H:%M:%S")
+            print(f"[GenFlow] [{end_time}] GFF sequence IDs renamed")
+
+    rule pangenome_roary:
+        """Compute pangenome and core gene alignment using Roary."""
+        input:
+            gff_done="logs/rename_gff.done"
+        output:
+            "results/core_gene_alignment.aln"
+        shell:
+            r"""
+            mkdir -p results/roary logs
+            echo "[GenFlow] [$(date +%H:%M:%S)] Running Roary pangenome analysis..."
+            GFFS=$(ls results/prokka_renamed/*.gff 2>/dev/null || true)
+            
+            if [ -z "$GFFS" ]; then
+                echo "Error: No Prokka GFFs found under results/prokka_renamed." >> logs/roary.log
+                exit 1
+            fi
+            
+            conda run -n genflow-roary roary -e --mafft -p {cfg[threads]} -f results/roary $GFFS >> logs/roary.log 2>&1 || true
+
+            if [ -f results/roary/core_gene_alignment.aln ]; then
+                ROARY_DIR=results/roary
+            else
+                ROARY_DIR=$(ls -td results/roary_* 2>/dev/null | head -n1 || true)
+            fi
+
+            if [ -z "$ROARY_DIR" ]; then
+                echo "Error: No Roary output directory found." >> logs/roary.log
+                exit 1
+            fi
+
+            if [ -f "$ROARY_DIR/core_gene_alignment.aln" ]; then
+                cp "$ROARY_DIR/core_gene_alignment.aln" {output}
+            elif [ -f "$ROARY_DIR/core_gene_alignment.aln.gz" ]; then
+                gunzip -c "$ROARY_DIR/core_gene_alignment.aln.gz" > {output}
+            else
+                echo "Error: core_gene_alignment.aln not found." >> logs/roary.log
+                exit 1
+            fi
+            echo "[GenFlow] [$(date +%H:%M:%S)] Roary pangenome analysis completed"
+            """
+
+    rule align_mafft_bacteria:
+        """Align Roary core gene alignment with MAFFT."""
+        input: "results/core_gene_alignment.aln"
+        output: "results/aligned.fasta"
+        shell:
+            r"""
+            set -euo pipefail
+            echo "[GenFlow] [$(date +%H:%M:%S)] Aligning core genes with MAFFT..."
+            conda run -n genflow mafft --auto --quiet --thread {cfg[threads]} {input} > {output} 2>> logs/mafft_align.log
+            echo "[GenFlow] [$(date +%H:%M:%S)] Core genes aligned with MAFFT"
+            """
+
+elif cfg["mode"] == "fungi":
+    # Fungi workflow: UFCG profiling and phylogenomic tree construction
+    rule run_ufcg:
+        """Profile fungal genomes with UFCG and build phylogenomic tree."""
+        input:
+            name_map="results/name_map.tsv"
+        output:
+            profiles=directory("results/ufcg/profiles"),
+            tree_dir=directory("results/ufcg/trees"),
+            aln="results/aligned.fasta",
+            faa="results/ufcg/core_genes.faa",
+            fna="results/ufcg/core_genes.fna"
+        shell:
+            r"""
+            set -euo pipefail
+            mkdir -p {output.profiles} {output.tree_dir} logs results/ufcg
+            echo "[GenFlow] UFCG: profiling fungal genomes" >> logs/ufcg.log
+            
+            shopt -s nullglob
+            FILES=(Intermediate/*.fna Intermediate/*.fasta Intermediate/*.fa)
+            CNT=0; for f in "${{FILES[@]}}"; do [ -f "$f" ] && CNT=$((CNT+1)); done
+            N=$CNT
+            echo "[GenFlow] [$(date +%H:%M:%S)] Found $N fungal genomes, profiling with UFCG..."
+            
+            i=0
+            for f in "${{FILES[@]}}"; do
+                [ -f "$f" ] || continue
+                i=$((i+1))
+                sample=$(basename "$f")
+                sample="${{sample%.fna}}"
+                sample="${{sample%.fasta}}"
+                sample="${{sample%.fa}}"
+                echo "[GenFlow] [UFCG] [${i}/${N}] Profiling $sample"
+                workdir="results/ufcg/$sample"
+                mkdir -p "$workdir"
+                ln -sf "$(realpath "$f")" "$workdir/$(basename "$f")"
+                
+                if ! conda run -n genflow ufcg profile -i "$workdir" -o "{output.profiles}" -s PRO -t {cfg[threads]} >> logs/ufcg.log 2>&1; then
+                    echo "[GenFlow] ERROR: ufcg profile failed for $sample" >> logs/ufcg.log
+                    exit 1
+                fi
+                
+                ucg_file="{output.profiles}/${{sample}}.ucg"
+                if [ ! -f "$ucg_file" ]; then 
+                    echo "Error: Expected .ucg not found: $ucg_file" >> logs/ufcg.log
+                    exit 1
+                fi
+            done
+            
+            N_GENOMES=$(ls -1 {output.profiles}/*.ucg 2>/dev/null | wc -l)
+            echo "[GenFlow] Number of genomes detected: $N_GENOMES" >> logs/ufcg.log
+            
+            if [ $N_GENOMES -lt 4 ]; then
+                echo "[GenFlow] ERROR: Fungi mode requires at least 4 genomes for UFCG tree reconstruction." >> logs/ufcg.log
+                exit 1
+            fi
+            
+            echo "[GenFlow] [$(date +%H:%M:%S)] Building phylogenomic tree with UFCG..."
+            TREE_METHOD="iq-tree"
+            if [ "{cfg[use_raxml]}" = "True" ]; then
+                TREE_METHOD="raxml"
+            fi
+            if ! conda run -n genflow ufcg tree -i {output.profiles} -l uid -o {output.tree_dir} -n genflow -t {cfg[threads]} -p $TREE_METHOD >> logs/ufcg.log 2>&1; then
+                echo "[GenFlow] ERROR: ufcg tree failed" >> logs/ufcg.log
+                exit 1
+            fi
+            
+            TREE_FILE="{output.tree_dir}/concatenated_gsi_45.nwk"
+            if [ ! -f "$TREE_FILE" ]; then
+                TREE_FILE="{output.tree_dir}/concatenated.nwk"
+            fi
+            
+            if [ -f "$TREE_FILE" ]; then
+                echo ">genflow_dummy" > {output.aln}
+                echo "ATCGATCG" >> {output.aln}
+            else
+                echo "[GenFlow] ERROR: ufcg tree did not produce expected tree file" >> logs/ufcg.log
+                exit 1
+            fi
+            
+            echo "[GenFlow] [$(date +%H:%M:%S)] UFCG profiling and tree construction complete"
+            touch {output.faa} {output.fna}
+            """
+
+# UFCG UID-to-labels mapping for tree relabeling
+rule create_ufcg_mappings:
+    """Extract UID to label and accession mappings from UFCG JSON profiles."""
+    input:
+        profiles="results/ufcg/profiles"
+    output:
+        uid_to_label="results/ufcg/uid_to_label.json",
+        uid_to_accession="results/ufcg/uid_to_accession.json"
+    run:
+        import json, re
+        from pathlib import Path
+        
+        profiles_dir = Path(input.profiles)
+        uid_to_label = {}
+        uid_to_accession = {}
+        
+        for ucg_file in sorted(profiles_dir.glob("*.ucg")):
+            try:
+                with open(ucg_file) as f:
+                    data = json.load(f)
+                    genome_info = data.get('genome_info', {})
+                    uid = genome_info.get('uid')
+                    label = genome_info.get('label', ucg_file.stem)
+                    
+                    accession = label
+                    match = re.search(r'(GC[FA]_\d+\.\d+)', label)
+                    if match:
+                        accession = match.group(1)
+                    
+                    if uid:
+                        uid_to_label[str(uid)] = label
+                        uid_to_accession[str(uid)] = accession
+                        print(f"Mapped uid {uid} -> {label}")
+            except Exception as e:
+                print(f"Error reading {ucg_file}: {e}")
+        
+        Path(output.uid_to_label).parent.mkdir(parents=True, exist_ok=True)
+        with open(output.uid_to_label, "w") as f:
+            json.dump(uid_to_label, f, indent=2)
+        with open(output.uid_to_accession, "w") as f:
+            json.dump(uid_to_accession, f, indent=2)
+        
+        print(f"Saved mappings for {len(uid_to_label)} genomes")
+
+# Shared rules: Alignment renaming and tree building (bacteria and fungi)
+rule rename_alignment:
+    """Rename FASTA headers using mappings from name_map.tsv."""
+    input:
+        aln="results/aligned.fasta",
+        map="results/name_map.tsv"
+    output:
+        "results/aligned.named.fasta"
+    run:
+        import os
+        from datetime import datetime
+        
+        start_time = datetime.now().strftime("%H:%M:%S")
+        print(f"[GenFlow] [{start_time}] Renaming alignment headers...")
+        
+        if os.path.getsize(input.map) < 10:
+            import shutil
+            shutil.copy(input.aln, output[0])
+        else:
+            name_map = {}
+            with open(input.map) as f:
+                f.readline()
+                for line in f:
+                    if line.strip():
+                        parts = line.rstrip().split('\t')
+                        if len(parts) >= 2:
+                            name_map[parts[0]] = parts[1]
+            
+            with open(input.aln) as inp, open(output[0], 'w') as out:
+                for line in inp:
+                    if line.startswith('>'):
+                        hdr = line[1:].strip()
+                        key = hdr.split()[0]
+                        new = name_map.get(key, hdr)
+                        out.write(f'>{new}\n')
+                    else:
+                        out.write(line)
+        
+        end_time = datetime.now().strftime("%H:%M:%S")
+        print(f"[GenFlow] [{end_time}] Alignment headers renamed")
+
+rule build_tree:
+    """Build phylogenomic tree (IQ-TREE or RAxML) from alignment or UFCG output."""
+    input: 
+        aln="results/aligned.named.fasta",
+        uid_to_label=lambda w: "results/ufcg/uid_to_label.json" if cfg.get("mode") == "fungi" else []
+    output: "results/phylogenomic-tree.txt"
+    params:
+        use_raxml=lambda wildcards: str(cfg.get("use_raxml", False)),
+        threads=lambda wildcards: str(cfg["threads"]),
+        DNA_mode=lambda wildcards: str(cfg["DNA_mode"]),
+        mode=lambda wildcards: str(cfg.get("mode", "bacteria"))
+    run:
+        import subprocess, json, re
+        from pathlib import Path
+        from datetime import datetime
+        
+        # Fungi mode: use UFCG tree with UID-to-label replacement
+        if params.mode == "fungi":
+            if Path("results/ufcg/trees/concatenated_gsi_45.nwk").exists():
+                with open("results/ufcg/trees/concatenated_gsi_45.nwk") as f:
+                    tree = f.read()
+                
+                if Path(input.uid_to_label).exists():
+                    with open(input.uid_to_label) as f:
+                        uid_to_label = json.load(f)
+                    for uid_str, label in uid_to_label.items():
+                        tree = re.sub(rf'\b{uid_str}(?=[:)])', label, tree)
+                
+                with open(output[0], "w") as f:
+                    f.write(tree)
+                
+                end_time = datetime.now().strftime("%H:%M:%S")
+                print(f"[GenFlow] [{end_time}] Tree built (UFCG)")
+                return
+            
+            elif Path("results/ufcg/trees/concatenated.nwk").exists():
+                with open("results/ufcg/trees/concatenated.nwk") as f:
+                    tree = f.read()
+                
+                if Path(input.uid_to_label).exists():
+                    with open(input.uid_to_label) as f:
+                        uid_to_label = json.load(f)
+                    for uid_str, label in uid_to_label.items():
+                        tree = re.sub(rf'\b{uid_str}(?=[:)])', label, tree)
+                
+                with open(output[0], "w") as f:
+                    f.write(tree)
+                
+                end_time = datetime.now().strftime("%H:%M:%S")
+                print(f"[GenFlow] [{end_time}] Phylogenomic tree built from UFCG profiles")
+                return
+        
+        # Bacteria: infer datatype and build tree
+        with open(input.aln) as f:
+            seqs = "".join([line.rstrip() for line in f if not line.startswith(">")])
+        
+        is_nuc = len([c for c in seqs if c.upper() not in "ACGTUN-."]) == 0
+        datatype_arg = "" if is_nuc else " --datatype AA"
+        
+        if params.use_raxml == "True":
+            start_time = datetime.now().strftime("%H:%M:%S")
+            print(f"[GenFlow] [{start_time}] Building phylogenomic tree with RAxML...")
+            cmd = f"conda run -n genflow raxml-ng --msa {input.aln} --model GTR+G --threads {params.threads} --tree pars{datatype_arg} --redo --prefix results/raxml_tree"
+            subprocess.run(cmd, shell=True, check=True)
+            import shutil
+            shutil.copy("results/raxml_tree.raxml.bestTree", output[0])
+        else:
+            start_time = datetime.now().strftime("%H:%M:%S")
+            print(f"[GenFlow] [{start_time}] Building phylogenomic tree with IQ-TREE...")
+            if is_nuc or params.DNA_mode == "True":
+                cmd = f"conda run -n genflow iqtree -s {input.aln} -m GTR+G -T {params.threads} -B 1000 -alrt 1000 --prefix results/iqtree -quiet"
+            else:
+                cmd = f"conda run -n genflow iqtree -s {input.aln} -m LG+G -T {params.threads} -B 1000 -alrt 1000 --prefix results/iqtree -quiet"
+            subprocess.run(cmd, shell=True, check=True)
+            import shutil
+            shutil.copy("results/iqtree.contree", output[0])
+        
+        end_time = datetime.now().strftime("%H:%M:%S")
+        print(f"[GenFlow] [{end_time}] Phylogenomic tree built")
+
+# ANI analysis (optional)
+if cfg.get("run_ani", False):
+    rule ani_prepare:
+        """Copy FASTA files into dedicated folder and create sample labels for pyANI."""
+        input: 
+            collected="Intermediate/.collected",
+            tree="results/phylogenomic-tree.txt",  
+            ncbi_done=lambda w: "logs/ncbi_renamed.done" if cfg.get("use_ncbi_download") else []
+        output:
+            labels="results/labels.txt",
+            fasta_dir=directory("results/fasta_files")
+        run:
+            import os, glob, shutil, pathlib
+            os.makedirs("results/fasta_files", exist_ok=True)
+            fas = sorted(glob.glob("Intermediate/*.fasta")) + sorted(glob.glob("Intermediate/*.fa")) + sorted(glob.glob("Intermediate/*.fna"))
+            if not fas:
+                raise SystemExit("No FASTA available for ANI.")
+            for f in fas:
+                dst = pathlib.Path("results/fasta_files") / (pathlib.Path(f).stem + ".fa")
+                shutil.copy2(f, dst)
+            paths = sorted(glob.glob("results/fasta_files/*.fa"))
+            with open(output.labels, "w") as L:
+                for p in paths:
+                    stem = pathlib.Path(p).stem
+                    L.write(f"{stem}\n")
+
+    rule ani_run:
+        """Compute average nucleotide identity using pyANI."""
+        input:
+            labels="results/labels.txt",
+            fasta_dir="results/fasta_files"
+        output:
+            "results/pyANI/ANIm_percentage_identity.tab"
+        shell:
+            r"""
+            set -euo pipefail
+            rm -rf results/pyANI
+            mkdir -p results/pyANI
+            echo "[GenFlow] [$(date +%H:%M:%S)] Running ANI analysis..."
+            if ! conda run -n genflow average_nucleotide_identity.py \
+                -i results/fasta_files \
+                -o results/pyANI \
+                --labels {input.labels} \
+                -g --gmethod seaborn --gformat svg,png -v -l logs/pyANI.log \
+                --force --workers {cfg[threads]} 2>&1; then
+                echo ""
+                echo "[GenFlow] ANI ANALYSIS FAILED"
+                echo "Reason: Genomes are too divergent"
+                echo "ANI requires genomes with significant sequence similarity"
+                echo "Current genomes are too different to produce alignments"
+                echo ""
+                touch results/pyANI/ANIm_percentage_identity.tab
+            else
+                echo "[GenFlow] [$(date +%H:%M:%S)] ANI analysis complete"
+            fi
+            """
+    rule ani_ggplot:
+        """Generate ANI heatmap visualization with ggplot2."""
+        input: "results/pyANI/ANIm_percentage_identity.tab"
+        output: 
+            "results/ani_heatmap.pdf",
+            "results/ani_heatmap.png"
+        shell:
+            r"""
+            set -euo pipefail
+            echo "[GenFlow] Generating ANI heatmap with ggplot2..."
+            if [ -s {input} ] && [ $(wc -c < {input}) -gt 100 ]; then
+                conda run -n genflow Rscript scripts/ANI.R results/pyANI/ANIm_percentage_identity.tab
+                echo "[GenFlow] ANI ggplot2 visualization complete"
+            else
+                echo "[GenFlow] ANI analysis produced no valid data - skipping heatmap"
+                touch results/ani_heatmap.pdf results/ani_heatmap.png
+            fi
+            """
+
+    rule ani_all:
+        """Aggregate ANI outputs for the pipeline."""
+        input: 
+            tree="results/phylogenomic-tree.txt",
+            ani_tab="results/pyANI/ANIm_percentage_identity.tab",
+            ani_pdf="results/ani_heatmap.pdf",
+            ani_png="results/ani_heatmap.png"
+        output: touch("results/.ani.done")
+        shell: "echo 'ANI analysis complete' > /dev/null"
+
+
+

@@ -1,0 +1,25 @@
+name: genflow
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.11
+  - snakemake
+  - prokka
+  - mafft
+  - blast
+  - hmmer
+  - iqtree
+  - raxml-ng
+  - ufcg
+  - pyani
+  - biopython
+  - pandas
+  - numpy
+  - seaborn
+  - matplotlib
+  - r-base
+  - r-ggplot2
+  - r-viridis
+  - ncbi-datasets-cli

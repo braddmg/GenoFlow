@@ -1,0 +1,15 @@
+# Build exclusions
+.git/
+.github/
+.snakemake/
+results/
+Intermediate/
+logs/
+*.log
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+*.egg-info/
+.DS_Store
+paper/

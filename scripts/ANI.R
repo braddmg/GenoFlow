@@ -40,7 +40,7 @@ formatted_numbers <- apply(data_matrix, c(1, 2), function(x) {
 })
 
 # Function to create and save heatmap
-create_heatmap <- function(data_matrix, filename, color_palette) {
+create_heatmap <- function(data_matrix, filename, color_palette, format) {
   heatmap_plot <- pheatmap(
     data_matrix,
     cluster_rows = TRUE,           # Cluster the rows (to maintain order)
@@ -62,15 +62,11 @@ create_heatmap <- function(data_matrix, filename, color_palette) {
     treeheight_col = 200,          # Increase column dendrogram height for larger branches
     show_colnames = TRUE,          # Show x-axis labels
     show_rownames = TRUE,          # Show y-axis labels
-    margin = c(10, 10, 10, 10)     # Increase margins (bottom, left, top, right)
+    margin = c(10, 10, 10, 10),    # Increase margins (bottom, left, top, right)
+    filename = filename             # Use pheatmap built-in filename parameter
   )
-  
-  svg(filename, width = 18, height = 18)  # Save heatmap to a PDF with appropriate dimensions
-  print(heatmap_plot)                       # Print the heatmap to the PDF device
-  dev.off()                                 # Close the PDF device
 }
 
-# Create and save different heatmaps with specified color palettes
-create_heatmap(data_matrix, "heatmap_v1.svg", viridis(100, option = "D"))
-create_heatmap(data_matrix, "heatmap_v2.svg", colorRampPalette(c("white", "red"))(100))
-create_heatmap(data_matrix, "heatmap_v3.svg", colorRampPalette(c("white", "orange", "red"))(100))
+# Create and save heatmap to PDF and PNG
+create_heatmap(data_matrix, "results/ani_heatmap.pdf", colorRampPalette(c("white", "orange", "red"))(100), "pdf")
+create_heatmap(data_matrix, "results/ani_heatmap.png", colorRampPalette(c("white", "orange", "red"))(100), "png")
